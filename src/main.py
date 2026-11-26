@@ -6,7 +6,7 @@ from rich.panel import Panel
 
 from src.config import settings
 from src.agent.browser_controller import BrowserController
-from src.agent.analyzer import PageAnalyzer
+from src.agent.analyzer import PageAnalyzer, is_reasoning_model
 from src.agent.runner import CourseRunner
 
 console = Console()
@@ -76,15 +76,11 @@ async def test_api():
 
     console.print(f"[cyan]Testing OpenAI API connection with model: [bold]{analyzer.model}[/bold]...[/cyan]")
     try:
-        is_reasoning_model = any(
-            token in analyzer.model.lower()
-            for token in ["o1", "o3", "luna", "astra", "sol", "terra", "gpt-6", "gpt-5.6"]
-        )
         kwargs = {
             "model": analyzer.model,
             "messages": [{"role": "user", "content": "Respond with 'API Connection Successful!' and nothing else."}],
         }
-        if is_reasoning_model:
+        if is_reasoning_model(analyzer.model):
             kwargs["max_completion_tokens"] = 30
         else:
             kwargs["max_tokens"] = 30
@@ -106,7 +102,7 @@ def main():
     run_parser.add_argument("--url", type=str, help="Override course URL")
     run_parser.add_argument("--model", type=str, default=None, help="OpenAI model (defaults to OPENAI_MODEL in .env)")
     run_parser.add_argument("--headless", action="store_true", default=None, help="Run browser in headless mode")
-    run_parser.add_argument("--max-steps", type=int, default=150, help="Maximum number of steps to execute")
+    run_parser.add_argument("--max-steps", type=int, default=None, help="Maximum number of steps (defaults to MAX_STEPS in .env, else 150)")
     run_parser.add_argument("--cdp", type=str, help="CDP endpoint to connect to existing Chrome (e.g. http://localhost:9222)")
 
     # Command: login

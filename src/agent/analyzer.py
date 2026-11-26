@@ -8,6 +8,22 @@ from src.config import settings
 
 console = Console()
 
+REASONING_TOKENS = ["o1", "o3", "luna", "astra", "sol", "terra", "gpt-6", "gpt-5.6"]
+
+
+PRINCIPLES = (
+    "CORE AI FOUNDATIONS PRINCIPLES (100% ACCURACY RULES):\n"
+    "1. Low-Risk Starting Points: When beginning with ChatGPT, always pick low-risk tasks grounded in approved internal notes (e.g. 'Turn approved meeting notes into a short agenda for the team to review').\n"
+    "2. Human in the Loop: ChatGPT is an assistant, NEVER an autonomous decision-maker. Never let ChatGPT book offsites, choose vendors, or make hiring/disciplinary choices. Always brainstorm with ChatGPT and have a human review/choose.\n"
+    "3. Privacy Minimization: Never share private employee/customer contact details. Remove contact details, use anonymized templates or generic examples.\n"
+    "4. Grounding & Accuracy: Always ground drafts in approved source materials. If a figure (e.g. 20% demand) cannot be found in approved sources, find the source or remove/qualify it. If key information is missing, ask for missing details before finalizing.\n\n"
+)
+
+
+def is_reasoning_model(model: str) -> bool:
+    return any(t in model.lower() for t in REASONING_TOKENS)
+
+
 class Coordinates(BaseModel):
     x: int
     y: int
@@ -99,6 +115,13 @@ class PageAnalyzer:
         system_prompt = (
             "You are an intelligent autonomous learning assistant specialized in taking courses on OpenAI Academy "
             "(specifically 'AI Foundations').\n\n"
+            "SIDEBAR RULE: The left/right side navigation (course outline, lesson list, module tree) is OFF LIMITS. "
+            "It is already stripped from the page context. NEVER click, select or target anything in it, even if it looks like a "
+            "'Lesson X.Y' link or says 'Continue'. Only act on the main lesson content and its bottom progression button.\n\n"
+            "ASSESSMENT RULE: Some quizzes are multi-question assessments (a row of progress dots at the top, a 'Complete the assessment' pill at the bottom right). "
+            "Answer ONLY the current question: SELECT_QUIZ_OPTION with the correct option(s) (the runner submits it and moves to the next question). "
+            "NEVER click or target 'Complete the assessment' - the runner clicks it automatically once every question is answered. "
+            "The page context field 'assessmentStatus' tells you how many questions are already submitted.\n\n"
             "MANDATORY PROTOCOL: Every question or slide is different. You must FIRST detect the exact task type "
             "(detected_task_type), and then execute the corresponding workflow!\n\n"
             "TASK CLASSIFICATION & WORKFLOW RULES:\n\n"
@@ -113,11 +136,12 @@ class PageAnalyzer:
             "   - Action: detected_task_type='MULTI_SELECT_MCQ', page_state='QUIZ_QUESTION', action_type='SELECT_QUIZ_OPTION', quiz.is_multi_select=true, quiz.selected_option_texts=['<choice 1>', '<choice 2>', '<choice 3>', '<choice 4>', ...].\n"
             "   - CRITICAL: Provide ALL required options in quiz.selected_option_texts. The runner will automatically check each one without toggling them off, then submit!\n\n"
             "3. 'MATCHING_PAIRS_OR_PUZZLE' (Matching Cards / Scenario vs Best Next Step / Puzzle Connectors):\n"
+            "   - ALSO the 'Match the pairs' layout: a left column of cards, a right column of category cards, '=' knobs between them, a Submit button and 'Complete the question' locked at the bottom. The runner DRAGS cards so each pair shares a row.\n"
             "   - Detected when: Screen displays '0 of 5 matched' (or 'X of Y matched') OR puzzle matching questions (e.g. 'Question 03/20: Select the most appropriate way to use ChatGPT for each task') with left and right card pairs.\n"
             "   - THE LOCK ICON 🔒 AT THE BOTTOM: If the bottom button displays a padlock icon 🔒 or says 'Complete the content above before moving on', IT IS LOCKED! You CANNOT click it to advance!\n"
             "   - NEVER output CLICK_TEXT on 'Complete the content above...' or CLICK_COORDINATES on the locked button!\n"
             "   - You MUST set: detected_task_type='MATCHING_PAIRS_OR_PUZZLE', is_progression_locked=true, action_type='SOLVE_MATCHING_PAIRS'.\n"
-            "   - Read the ACTUAL cards on screen / DOM matchingExercise context and output the pairs in matching_pairs.\n"
+            "   - Read the ACTUAL cards on screen / DOM matchingExercise context and output the pairs in matching_pairs: scenario_text = EXACT text of a LEFT card, match_text = EXACT text of its partner on the RIGHT. Include EVERY row exactly once and use each right card exactly once.\n"
             "   - The runner will click each pair sequentially, confirm completion, submit if needed, and advance!\n\n"
             "4. 'PROMPT_BUILDER' (Suggestion Chips / 'Add details'):\n"
             "   - Detected when: Suggestion chips for Audience, Format, Tone, Length are displayed with a locked button below.\n"
@@ -135,11 +159,7 @@ class PageAnalyzer:
             "     Click it immediately to advance to the next module! action_type='CLICK_TEXT', target_text='<exact text of the LESSON button>'.\n"
             "     Do not waste turns clicking optional accordions or text if the next lesson button is already unlocked.\n"
             "     If the next lesson button is not yet visible, use action_type='SCROLL_TO_BOTTOM' to bring it into view.\n\n"
-            "CORE AI FOUNDATIONS PRINCIPLES (100% ACCURACY RULES):\n"
-            "1. Low-Risk Starting Points: When beginning with ChatGPT, always pick low-risk tasks grounded in approved internal notes (e.g. 'Turn approved meeting notes into a short agenda for the team to review').\n"
-            "2. Human in the Loop: ChatGPT is an assistant, NEVER an autonomous decision-maker. Never let ChatGPT book offsites, choose vendors, or make hiring/disciplinary choices. Always brainstorm with ChatGPT and have a human review/choose.\n"
-            "3. Privacy Minimization: Never share private employee/customer contact details. Remove contact details, use anonymized templates or generic examples.\n"
-            "4. Grounding & Accuracy: Always ground drafts in approved source materials. If a figure (e.g. 20% demand) cannot be found in approved sources, find the source or remove/qualify it. If key information is missing, ask for missing details before finalizing.\n\n"
+            + PRINCIPLES +
             "SPEED, ACCURACY & DIRECT ACTION PROTOCOL:\n"
             "- When a quiz question is on screen with its options visible, IMMEDIATELY select the correct option(s) using action_type='SELECT_QUIZ_OPTION'!\n"
             "- NEVER loop SCROLL_DOWN or WAIT on quiz questions. The runner automatically aligns the screen and submits the verified answers.\n"
@@ -162,40 +182,31 @@ class PageAnalyzer:
             }
         ]
 
-        # Adapt parameters for reasoning models (e.g. o1, gpt-6-luna, gpt-6-astra) vs standard models
-        is_reasoning_model = any(
-            token in self.model.lower()
-            for token in ["o1", "o3", "luna", "astra", "sol", "terra", "gpt-6", "gpt-5.6"]
-        )
-        system_role = "developer" if is_reasoning_model else "system"
-
         messages = [
-            {"role": system_role, "content": system_prompt},
+            {"role": self.system_role(), "content": system_prompt},
             {"role": "user", "content": user_content}
         ]
+        return await self.parse(messages, AnalysisResponse, effort="low", temperature=0.1)
 
-        kwargs: Dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "response_format": AnalysisResponse
-        }
+    def system_role(self) -> str:
+        return "developer" if is_reasoning_model(self.model) else "system"
 
-        # Temperature vs reasoning effort
-        if not is_reasoning_model:
-            kwargs["temperature"] = 0.1
+    async def parse(self, messages: list, response_format: type, effort: str = "low", temperature: float = 0.1):
+        """Structured-output call. Uses reasoning_effort for reasoning models, temperature otherwise; retries without
+        either if the model rejects the parameter."""
+        kwargs: Dict[str, Any] = {"model": self.model, "messages": messages, "response_format": response_format}
+        if is_reasoning_model(self.model):
+            kwargs["reasoning_effort"] = effort
         else:
-            kwargs["reasoning_effort"] = "low"
-
-        # Use parse with Pydantic for guaranteed schema adherence with parameter fallback
+            kwargs["temperature"] = temperature
         try:
             response = await self.client.beta.chat.completions.parse(**kwargs)
         except Exception as e:
-            err_msg = str(e).lower()
-            if "temperature" in err_msg or "reasoning_effort" in err_msg or "unrecognized request argument" in err_msg:
+            err = str(e).lower()
+            if "temperature" in err or "reasoning_effort" in err or "unrecognized request argument" in err:
                 kwargs.pop("temperature", None)
                 kwargs.pop("reasoning_effort", None)
                 response = await self.client.beta.chat.completions.parse(**kwargs)
             else:
-                raise e
-
+                raise
         return response.choices[0].message.parsed
