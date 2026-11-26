@@ -4,4 +4,5 @@ __pycache__/
 .env
 browser_profile/
 logs/screenshots/
+logs/answers.json
 .DS_Store

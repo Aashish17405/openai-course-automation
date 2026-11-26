@@ -94,15 +94,23 @@ uv run python -m src.main run --url "https://academy.openai.com/learning-path/ai
    - Takes a high-resolution screenshot of the current page viewport.
    - Extracts all interactive elements (buttons, inputs, radios, checkboxes, headings, text preview) from the DOM.
 2. **AI Multimodal Reasoning (`src/agent/analyzer.py`)**:
-   - Sends the screenshot and DOM context to OpenAI API (`gpt-4o`).
+   - Sends the screenshot and DOM context to the OpenAI model set in `OPENAI_MODEL`.
    - Identifies the state: `READING_LESSON`, `QUIZ_QUESTION`, `QUIZ_FEEDBACK`, `COURSE_INDEX`, `COMPLETED`, or `LOGIN_REQUIRED`.
    - When a quiz is detected, it reads the question and choices, reasons over AI principles (tokens, transformers, prompt engineering, RAG, safety, evaluation), and picks the correct answer(s).
+   - The side navigation / course outline is detected (semantic tags **or** layout) and stripped from the context. Every click goes through one guard that refuses anything inside it.
 3. **Action Execution (`src/agent/browser_controller.py`)**:
    - Simulates human reading pauses.
    - Scrolls down to ensure LMS tracking triggers.
    - Clicks quiz choices, clicks Submit, and clicks Next / Continue.
-4. **Debug Logs**:
+4. **Self-healing**: API calls retry with backoff; if the page does not change for 5 / 10 / 15 steps the agent forces progression, reloads, then stops.
+5. **Answer quality** (`src/agent/solver.py`): a dedicated solver answers every quiz and matching exercise. It reads the exact question/options from the page, uses the lesson text the agent has read as course material, reasons at `SOLVE_EFFORT` (default `high`) and takes a majority vote over `ANSWER_VOTES` independent answers (default 3, run in parallel). Answers and any 'correct / incorrect' feedback are remembered in `logs/answers.json`; on a retake it never repeats an answer known to be wrong or shaky. Set `ANSWER_VOTES=0` for the old single-pass behaviour (cheaper, less accurate).
+6. **Assessments** (several questions + progress dots): answers and submits each question, moves to the next unanswered one, and clicks *Complete the assessment* only after every question is answered (premature clicks are blocked).
+7. **Debug Logs**:
    - Screenshots of each step are stored under `logs/screenshots/` for audit and review.
+
+**Speed:** keep `SLOW_MO_MS=0` in `.env` (it adds that delay to every mouse/keyboard action).
+
+**Self-checks:** `uv run python tests/test_solver.py` (voting/memory logic) and `uv run python tests/smoke_sidebar.py` (browser flows) run a headless fake course page and verifies the sidebar is never read or clicked.
 
 ---
 
@@ -115,6 +123,7 @@ openai-course-automation/
 ├── run.bat                     # Windows CMD quick launcher
 ├── run.ps1                     # PowerShell quick launcher
 ├── README.md                   # Complete documentation
+├── tests/smoke_sidebar.py      # Headless self-check (sidebar safety, answer hints)
 ├── logs/                       # Step-by-step debug screenshots
 ├── browser_profile/            # Persistent browser session & cookies
 └── src/

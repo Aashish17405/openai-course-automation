@@ -1,8 +1,7 @@
 import asyncio
 import re
 import time
-from pathlib import Path
-from typing import Optional, List
+from typing import Optional
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -10,6 +9,7 @@ from rich.table import Table
 from src.config import settings
 from .browser_controller import BrowserController
 from .analyzer import PageAnalyzer, AnalysisResponse, MatchPair
+from .solver import Solver
 
 console = Console()
 
@@ -25,6 +25,233 @@ class CourseRunner:
         self.last_url = ""
         self.last_action_sig = ""
         self.repeat_action_count = 0
+        self.current_dom_data = {}
+        self.last_sig = None
+        self.stagnant = 0       # consecutive steps where the page did not change at all
+        self.done_streak = 0    # consecutive steps the model reported COMPLETED
+        self.answered = set()   # question (dot) indices already submitted in the CURRENT assessment
+        self.solver = Solver(analyzer)   # course notes + high-effort voting + answer memory
+        self._solved = {}                # question/matching signature -> solver result (don't re-solve the same screen)
+        self._last_key = None            # memory key of the last answered question (for correct/wrong feedback)
+        self._assess_key = None
+        self._no_assess = 0
+        self.complete_wait = 0
+        self._done_sigs = set()          # signatures of questions whose Submit was confirmed in the CURRENT test
+        self._qdone = None               # option-set signature of the question just answered (its explanation is on screen)
+        self._qtries = {}                # option-set signature -> attempts, so a stuck question falls back to the model
+
+    # next-question buttons shown after an answer; the last one ('Complete the test') ends a non-dotted quiz
+    ADV_RE = re.compile(r"^(next( question)?|continue|finish( (quiz|test|assessment))?|see (my )?results|complete (the )?(assessment|quiz|test|exam))$", re.I)
+
+    @staticmethod
+    def _qsig(quiz: dict) -> frozenset:
+        """Identity of the question on screen: the start of each option (feedback appended later doesn't change it)."""
+        return frozenset(re.sub(r"\W+", " ", o.get("text", "").lower()).strip()[:30] for o in quiz.get("options", []))
+
+    def _quiz_open(self, dom: dict) -> bool:
+        """A question with options is on screen and not answered yet: nothing may skip past it."""
+        q = dom.get("quizData") or {}
+        return len(q.get("options", [])) >= 2 and self._qsig(q) != self._qdone
+
+    async def _advance(self, dom: dict) -> bool:
+        """Click the enabled Next / Continue / Finish / Complete-the-test button (never the answer's Submit)."""
+        dotted = bool((dom.get("assessment") or {}).get("total"))   # dotted assessments gate their own 'Complete' (_assessment_turn)
+        ends = lambda t: bool(re.match(r"(finish|complete|see)", t))
+        label = lambda b: re.sub(r"^[^a-z]+|[^a-z]+$", "", (b.get("text") or b.get("ariaLabel") or "").lower())   # 'Next →' -> 'next'
+        cands = [(label(b), b) for b in dom.get("buttons", []) if not b.get("disabled")]
+        cands = [(t, b) for t, b in cands if self.ADV_RE.match(t) and not (dotted and ends(t))]
+        for t, b in sorted(cands, key=lambda c: ends(c[0])):        # a plain Next always beats Complete/Finish
+            if (b.get("text") and await self.controller.click_by_text(b["text"], require_enabled=True)) or await self.controller.click_at_point(b["x"], b["y"]):
+                console.print(f"[bold green]✓ Moving on: '{t}'[/bold green]")
+                return True
+        console.print("[dim]No Next/Continue button found yet. Buttons seen: "
+                      + ", ".join(repr((b.get("text") or b.get("ariaLabel"))[:25]) for b in dom.get("buttons", [])[:12]) + "[/dim]")
+        return False
+
+    async def _took_effect(self, before: dict) -> bool:
+        """Did Submit do anything? The page text / question changed, or the (enabled) Submit button is gone or spent."""
+        b = before.get("quizData") or {}
+        for _ in range(5):
+            await asyncio.sleep(0.4)
+            now = await self.controller.extract_interactive_dom()
+            q = now.get("quizData") or {}
+            if now.get("bodyTextPreview") != before.get("bodyTextPreview") or self._qsig(q) != self._qsig(b) \
+                    or (b.get("isSubmitEnabled") and not q.get("isSubmitEnabled")):
+                return True
+        return False
+
+    async def _quiz_turn(self, dom: dict) -> bool:
+        """One quiz question without the vision model: solve -> select -> Submit -> read explanation -> Next. True = handled."""
+        q = dom.get("quizData") or {}
+        if len(q.get("options", [])) < 2 or self.solver.votes <= 0:
+            return False
+        total = (dom.get("assessment") or {}).get("total")
+        if total and len(self._done_sigs) >= total:      # every question is in: the assessment turn presses 'Complete'
+            return False
+        sig = self._qsig(q)
+        if sig == self._qdone:                       # answered; the explanation is showing, wait for / press Next
+            if await self._advance(dom):
+                return True
+            self._qtries[("adv", sig)] = self._qtries.get(("adv", sig), 0) + 1
+            if self._qtries[("adv", sig)] <= 3:
+                await asyncio.sleep(1.0)
+                return True
+            return False                             # no Next button: the assessment turn may still navigate by arrows / dots
+        self._qtries[sig] = self._qtries.get(sig, 0) + 1
+        if self._qtries[sig] > 3:                    # could not answer it deterministically: let the vision model try
+            return False
+        console.print(Panel(f"[bold]{q.get('questionPrompt', '')[:200]}[/bold]", title="Quiz question", border_style="cyan"))
+        step = AnalysisResponse.model_validate({
+            "detected_task_type": "SINGLE_SELECT_MCQ", "page_state": "QUIZ_QUESTION", "observations": "quiz question",
+            "quiz": {"question_text": q.get("questionPrompt", ""), "selected_option_texts": [], "explanation": ""},
+            "action": {"action_type": "SELECT_QUIZ_OPTION", "explanation": "deterministic quiz turn"}})
+        await self.execute_action(step)
+        return True
+
+    @staticmethod
+    def _words(text: str) -> set:
+        return set(re.findall(r"\w{2,}", text.lower()))
+
+    def _match_dom_option(self, raw: str, dom_options: list, threshold: float) -> Optional[int]:
+        """Index of the on-screen option most similar (Jaccard) to `raw`, or None below `threshold`."""
+        for i, opt in enumerate(dom_options):      # the solver hands back the on-screen text verbatim: exact match beats word overlap
+            if raw.strip() == opt.get("text", "").strip():
+                return i
+        rw = self._words(raw)
+        best_idx, best = None, 0.0
+        for i, opt in enumerate(dom_options):
+            dw = self._words(opt.get("text", ""))
+            if rw and dw:
+                j = len(rw & dw) / len(rw | dw)
+                if j > best:
+                    best_idx, best = i, j
+        return best_idx if best >= threshold else None
+
+    COMPLETE_RE = re.compile(r"complete (the )?(assessment|quiz|test|exam)", re.I)
+
+    def _assess(self, dom: dict) -> Optional[dict]:
+        """Progress of a multi-question assessment, or None when the page is not one."""
+        a = dom.get("assessment")
+        if not a:
+            self._no_assess += 1
+            if self._no_assess >= 3:        # left the assessment: forget its progress
+                self.answered.clear()
+                self._assess_key = None
+            return None
+        self._no_assess = 0
+        cur = a.get("current")
+        total = a.get("total") if cur is not None else 0     # without a known current dot we cannot count questions
+        key = (dom.get("url"), total)
+        if key != self._assess_key:                          # different assessment: start counting afresh
+            self.answered.clear()    # (_done_sigs is kept: the dot count can flicker, the questions we submitted can't change)
+            self._assess_key = key
+        q = dom.get("quizData") or {}
+        cur_done = cur is not None and cur in self.answered      # only ever set after a CONFIRMED submit (never guessed from a faded button)
+        comp = a.get("completeButton") or {}
+        if total:
+            all_done = len(self._done_sigs) >= total             # distinct questions confirmed submitted (the 'current dot' can flicker)
+        else:
+            all_done = (not q.get("options") or cur_done) and bool(comp) and not comp.get("disabled", True)
+        return {"a": a, "total": total, "current": cur, "cur_done": cur_done, "all_done": all_done}
+
+    async def _next_question(self, st: dict) -> None:
+        """Move to the next unanswered question via the arrow (or its dot)."""
+        a, total, cur = st["a"], st["total"], st["current"]
+        unanswered = [i for i in range(total) if i not in self.answered]
+        target = None
+        if unanswered and cur is not None:
+            target = next((i for i in unanswered if i > cur), unanswered[0])
+        arrow = a.get("prevArrow") if (target is not None and target < cur) else a.get("nextArrow")
+        console.print(f"[cyan]Question {(cur or 0) + 1}/{total or '?'} answered -> moving to {'question ' + str(target + 1) if target is not None else 'next question'}...[/cyan]")
+        done = False
+        if arrow and not arrow.get("disabled"):
+            done = await self.controller.click_at_point(arrow["x"], arrow["y"])
+        if not done and target is not None and target < len(a.get("dots", [])):
+            d = a["dots"][target]
+            done = await self.controller.click_at_point(d["x"], d["y"])
+        if not done:
+            await self.controller.click_by_text("Next", require_enabled=True)
+        await asyncio.sleep(0.8)
+
+    async def _assessment_turn(self, dom: dict) -> bool:
+        """Drives a multi-question assessment between model calls. True = this step was handled, skip the model."""
+        st = self._assess(dom)
+        if not st:
+            return False
+        comp = st["a"].get("completeButton")
+        if st["all_done"] and comp:
+            if comp.get("disabled") and self.complete_wait < 2:     # give the page a moment to unlock it
+                self.complete_wait += 1
+                console.print("[dim]All questions answered; waiting for 'Complete the assessment' to unlock...[/dim]")
+                await asyncio.sleep(1.0)
+                return True
+            console.print(Panel(f"[bold green]All {st['total'] or ''} questions answered.[/bold green]\nClicking '{comp['text']}'.", border_style="green"))
+            ok = await self.controller.click_by_text(comp["text"]) or await self.controller.click_at_point(comp["x"], comp["y"])
+            self.complete_wait = 0
+            self._done_sigs.clear()          # next test starts from zero
+            self._qdone = None
+            await asyncio.sleep(1.5)
+            return ok or True
+        self.complete_wait = 0
+        if st["cur_done"] and not st["all_done"]:
+            await self._next_question(st)
+            return True
+        return False
+
+    async def _block_premature_complete(self, analysis: AnalysisResponse, dom: dict) -> bool:
+        """True if the model tried to press 'Complete the assessment' before every question is answered."""
+        st = self._assess(dom)
+        comp = (st or {}).get("a", {}).get("completeButton")
+        if not st or not comp or st["all_done"]:
+            return False
+        act = analysis.action
+        c = act.coordinates
+        by_text = bool(self.COMPLETE_RE.search(act.target_text or ""))
+        by_xy = bool(c and abs(c.x - comp["x"]) < 80 and abs(c.y - comp["y"]) < 40)
+        if not (by_text or by_xy):
+            return False
+        console.print(f"[bold yellow]⛔ Blocked 'Complete the assessment': only {len(self.answered)}/{st['total'] or '?'} questions answered.[/bold yellow]")
+        if st["cur_done"]:
+            await self._next_question(st)
+        return True
+
+    @staticmethod
+    def _new_hits(pattern: str, after: str, before: str) -> bool:
+        """Does `pattern` occur more often after an action than before it? (ignores words already in the question text)"""
+        return len(re.findall(pattern, after.lower())) > len(re.findall(pattern, before.lower()))
+
+    async def _solver_pick(self, analysis: AnalysisResponse, dom_quiz: dict, dom_options: list, fallback: list) -> list:
+        """Answer a quiz question with the dedicated solver (course notes, high effort, majority vote, memory)."""
+        question = dom_quiz.get("questionPrompt") or (analysis.quiz.question_text if analysis.quiz else "")
+        texts = [o.get("text", "") for o in dom_options]
+        sig = (question, tuple(texts))
+        if sig not in self._solved:
+            m = re.search(r"select\s+(two|three|four|five|\d+)", question, re.I)
+            radios = all(o.get("type") == "radio" for o in dom_options)
+            required = (dom_quiz.get("requiredCount") or 1) if (m or radios) else 0
+            console.print(f"[cyan]Solving with course notes + {self.solver.votes} independent answers...[/cyan]")
+            # mid-course practice = not an assessment page and not a numbered quiz ('Question 2/20'); graded tests never use the length bias
+            practice = not self.current_dom_data.get("assessment") and not dom_quiz.get("indicator")
+            self._solved[sig] = await self.solver.answer(question, texts, required, practice=practice)
+        res = self._solved[sig]
+        if not res:
+            console.print("[yellow]Solver unavailable; using the page-analysis answer.[/yellow]")
+            return fallback
+        self._last_key = res["key"]
+        chosen = [texts[i] for i in res["indices"]]
+        console.print(Panel(f"[bold green]Solver answer[/bold green] ({res['source']}, confidence {res['confidence']:.0%})\n"
+                            + "\n".join(f"• {c}" for c in chosen), border_style="green"))
+        return chosen
+
+    async def _try_advance(self) -> bool:
+        """Click the unlocked primary progression button, else the first enabled generic Continue/Next."""
+        prog = (await self.controller.extract_interactive_dom()).get("primaryProgressionButton") or {}
+        if prog.get("text") and not prog.get("disabled") and await self.controller.click_by_text(prog["text"], require_enabled=True):
+            return True
+        for btn in ["Continue", "Next", "Next Lesson", "Complete & Continue"]:
+            if await self.controller.click_by_text(btn, require_enabled=True):
+                return True
+        return False
 
     def print_status(self, step: int, analysis: AnalysisResponse) -> None:
         """Pretty-prints the analysis results to terminal."""
@@ -42,7 +269,7 @@ class CourseRunner:
             table.add_row("Task to Unlock", f"[bold cyan]{analysis.task_goal}[/bold cyan]")
 
         if analysis.matching_pairs:
-            pairs_text = "\n".join(f"• [cyan]{p.scenario_text[:35]}...[/cyan] ➔ [green]{p.match_text}[/green]" for p in analysis.matching_pairs[:5])
+            pairs_text = "\n".join(f"• [cyan]{p.scenario_text[:35]}...[/cyan] ➔ [green]{p.match_text}[/green]" for p in analysis.matching_pairs[:8])
             table.add_row("Matching Pairs", pairs_text)
 
         if analysis.quiz:
@@ -102,7 +329,8 @@ class CourseRunner:
             pass
 
         # Wait loop: poll every 2 seconds for up to 10 minutes
-        while True:
+        deadline = time.monotonic() + 600
+        while time.monotonic() < deadline:
             await asyncio.sleep(2)
             if not await self.is_login_page():
                 console.print("\n[bold green]✓ Login confirmed! Loading course lessons...[/bold green]")
@@ -110,6 +338,7 @@ class CourseRunner:
                 await self.controller.navigate_to_course()
                 await self.controller.wait_for_idle(2.0)
                 return
+        raise RuntimeError("Login was not completed within 10 minutes.")
 
     async def execute_action(self, analysis: AnalysisResponse) -> bool:
         """Executes the action decided by the AI."""
@@ -144,11 +373,8 @@ class CourseRunner:
                 await asyncio.sleep(2)
             return True
 
-        if action.action_type == "FINISHED" or analysis.page_state == "COMPLETED":
-            console.print(Panel(
-                "[bold green]COURSE COMPLETED! ALL LESSONS PROCESSED SUCCESSFULLY![/bold green]",
-                border_style="green"
-            ))
+        if action.action_type == "FINISHED":
+            self._print_done()
             return False
 
         if action.action_type == "SCROLL_UP":
@@ -291,22 +517,42 @@ class CourseRunner:
                     else:
                         pairs = valid_pairs
 
+            cards = await self.controller.read_matching_cards() if self.solver.votes > 0 else None
+            if cards:
+                left, right = cards
+                sig = (tuple(left), tuple(right))
+                if sig not in self._solved:
+                    console.print(f"[cyan]Solving matching exercise ({len(left)} pairs) with course notes + {self.solver.votes} independent answers...[/cyan]")
+                    self._solved[sig] = await self.solver.match(left, right)
+                perm = self._solved[sig]
+                if perm:
+                    pairs = [MatchPair(scenario_text=left[i], match_text=right[j]) for i, j in enumerate(perm)]
+
             if not pairs:
-                pairs = all_known_curriculum_pairs[:5]
+                console.print("[yellow]No matching pairs to apply (model gave none and nothing on screen matched); retrying next turn.[/yellow]")
+                return False
 
             console.print(Panel(
                 f"[bold cyan]SOLVING MATCH-THE-FOLLOWING EXERCISE ({len(pairs)} pairs to match)[/bold cyan]\n"
-                + "\n".join(f"• {p.scenario_text[:40]}... ➔ {p.match_text}" for p in pairs[:5]),
+                + "\n".join(f"• {p.scenario_text[:40]}... ➔ {p.match_text}" for p in pairs[:8]),
                 border_style="cyan"
             ))
 
+            # 'N of M matched' / 'Select either side' = click-to-pair UI. Anything else ('Match the pairs' rows) = drag-to-reorder UI.
+            m_status = (self.current_dom_data.get("matchingExercise") or {}).get("status", "")
             matched_any = False
-            for idx, p in enumerate(pairs, 1):
-                console.print(f"\n[bold yellow]Matching Pair {idx}/{len(pairs)}:[/bold yellow]")
-                pair_ok = await self.controller.click_matching_pair(p.scenario_text, p.match_text)
-                if pair_ok:
-                    matched_any = True
-                await asyncio.sleep(0.8)
+            if "matched" in m_status or "Select either side" in m_status:
+                for idx, p in enumerate(pairs, 1):
+                    console.print(f"\n[bold yellow]Matching Pair {idx}/{len(pairs)}:[/bold yellow]")
+                    if await self.controller.click_matching_pair(p.scenario_text, p.match_text):
+                        matched_any = True
+                    await asyncio.sleep(0.8)
+            else:
+                console.print("[bold cyan]Drag-to-reorder matching: arranging cards row by row...[/bold cyan]")
+                matched_any = await self.controller.solve_by_reorder([(p.scenario_text, p.match_text) for p in pairs])
+                if not matched_any:
+                    console.print("[yellow]Could not arrange the cards; NOT submitting. Will retry next turn.[/yellow]")
+                    return False
 
             # Check for SUBMIT button and submit if available/enabled
             submitted = False
@@ -522,40 +768,31 @@ class CourseRunner:
                 ]
             }
 
-            question_text = (analysis.quiz.question_text if analysis.quiz else "") or ((self.current_dom_data.get("quizData") or {}).get("questionPrompt", "") if hasattr(self, "current_dom_data") and self.current_dom_data else "")
-            context_corpus = f"{question_text} {analysis.observations} {getattr(analysis, 'task_goal', '') or ''} {self.current_dom_data.get('bodyTextPreview', '') if hasattr(self, 'current_dom_data') and self.current_dom_data else ''}".lower()
+            dom_quiz = self.current_dom_data.get("quizData") or {}
+            dom_options = dom_quiz.get("options", [])
+            question_text = f"{analysis.quiz.question_text if analysis.quiz else ''} {dom_quiz.get('questionPrompt', '')}".lower()
+
+            # The curriculum map is only a HINT: it must key off the question itself (not page noise), every known answer
+            # must exist on screen, and the count must match what the page asks for. Otherwise the model's answer stands.
+            map_applied = False
             for key, known_opts in verified_answers_map.items():
-                if key.lower() in context_corpus:
+                if key.lower() not in question_text:
+                    continue
+                required = dom_quiz.get("requiredCount")
+                if all(self._match_dom_option(o, dom_options, 0.5) is not None for o in known_opts) and (not required or required == len(known_opts)):
                     console.print(f"[bold green]Applied verified curriculum answers for '{key}' ({len(known_opts)} options)[/bold green]")
                     options_to_click = known_opts
+                    map_applied = True
                     break
+                console.print(f"[dim]Ignored curriculum hint '{key}': answers don't match the options on screen.[/dim]")
 
-            # Resolve AI option text against exact DOM options using token overlap and determine exact DOM index
-            dom_options = []
-            if hasattr(self, "current_dom_data") and self.current_dom_data and self.current_dom_data.get("quizData"):
-                dom_options = (self.current_dom_data.get("quizData") or {}).get("options", [])
+            if not map_applied and dom_options and self.solver.votes > 0:
+                options_to_click = await self._solver_pick(analysis, dom_quiz, dom_options, options_to_click)
 
             targets_with_indices = []
             for raw_opt in options_to_click:
-                best_dom_opt = None
-                best_idx = None
-                best_jaccard = 0.0
-                raw_words = set(re.findall(r"\w{2,}", raw_opt.lower()))
-                for d_idx, d_opt in enumerate(dom_options):
-                    d_text = d_opt.get("text", "")
-                    d_words = set(re.findall(r"\w{2,}", d_text.lower()))
-                    if raw_words and d_words:
-                        inter = len(raw_words.intersection(d_words))
-                        union = len(raw_words.union(d_words))
-                        jaccard = inter / union if union > 0 else 0
-                        if jaccard > best_jaccard:
-                            best_jaccard = jaccard
-                            best_idx = d_idx
-                            best_dom_opt = d_text
-                if best_dom_opt and best_jaccard >= 0.20:
-                    targets_with_indices.append((best_dom_opt, best_idx))
-                else:
-                    targets_with_indices.append((raw_opt, None))
+                idx = self._match_dom_option(raw_opt, dom_options, 0.20)
+                targets_with_indices.append((dom_options[idx].get("text", raw_opt), idx) if idx is not None else (raw_opt, None))
 
             is_multi = bool(analysis.quiz and analysis.quiz.is_multi_select) or (len(targets_with_indices) > 1)
             mode_label = f"MULTI-SELECT QUESTION ({len(targets_with_indices)} CHECKBOXES)" if is_multi else "SINGLE-SELECT QUESTION (RADIO)"
@@ -593,26 +830,56 @@ class CourseRunner:
                 console.print("[yellow]Option selection not confirmed. Aborting SUBMIT to prevent empty submission.[/yellow]")
                 return False
 
-            await asyncio.sleep(0.5)
+            # The faded Submit must light up once the option registered. Wait for it; if it never does, click a single-select option again once.
+            for attempt in range(2):
+                for _ in range(6):
+                    qs = (await self.controller.extract_interactive_dom()).get("quizData") or {}
+                    if not qs.get("hasSubmit") or qs.get("isSubmitEnabled"):
+                        break
+                    await asyncio.sleep(0.4)
+                else:
+                    # never re-click something that already reads as selected (a second click would un-tick a checkbox)
+                    if attempt == 0 and len(targets_with_indices) == 1 and not any(o.get("isChecked") for o in qs.get("options", [])):
+                        console.print("[dim]Submit still faded: clicking the option again...[/dim]")
+                        await self.controller.click_by_text(targets_with_indices[0][0], exact=False, require_enabled=False)
+                        continue
+                break
 
-            # Auto-submit ONLY if submit button is verified ENABLED!
+            # Submit, then PROVE it worked (page changed / Submit spent). Fallback: the page's own 'or press Enter'.
+            before = await self.controller.extract_interactive_dom()
             submitted = False
             for s_name in ["SUBMIT", "Submit", "Check Answer", "Check"]:
                 if await self.controller.click_by_text(s_name, require_enabled=True):
-                    console.print(f"[bold green]✓ Answer submitted: '{s_name}'[/bold green]")
+                    console.print(f"[bold green]✓ Submit clicked: '{s_name}'[/bold green]")
                     submitted = True
                     break
+            if not (submitted and await self._took_effect(before)):
+                console.print("[dim]Submit not confirmed; pressing Enter...[/dim]")
+                await self.controller.page.keyboard.press("Enter")
+                if not await self._took_effect(before):
+                    console.print("[yellow]Answer not accepted yet; will retry this question.[/yellow]")
+                    return True
 
-            if not submitted:
-                console.print("[dim]Options selected. SUBMIT button not yet enabled or awaiting further selection.[/dim]")
-                return True
+            a = self.current_dom_data.get("assessment") or {}
+            if a.get("current") is not None:
+                self.answered.add(a["current"])      # submitted: this question is done
+            self._qdone = self._qsig(dom_quiz)
+            self._done_sigs.add(self._qdone)
 
-            # If submitted, check if feedback screen immediately displayed 'Continue' / 'Next'
+            # Read the explanation (right/wrong verdict + it becomes course material for later questions), then move on
             await asyncio.sleep(0.8)
-            for cont_name in ["Continue", "Next", "Next Question"]:
-                if await self.controller.click_by_text(cont_name, require_enabled=True):
-                    console.print(f"[bold green]✓ Feedback acknowledged: '{cont_name}'[/bold green]")
-                    break
+            after_dom = await self.controller.extract_interactive_dom()
+            after = after_dom.get("bodyTextPreview", "")
+            before = self.current_dom_data.get("bodyTextPreview", "")
+            if self._last_key:
+                if self._new_hits(r"\b(incorrect|not quite|wrong|not correct|try again)\b", after, before):
+                    self.solver.set_verdict(self._last_key, "wrong")
+                elif self._new_hits(r"\b(correct|well done|great job|that's right)\b", after, before):
+                    self.solver.set_verdict(self._last_key, "correct")
+                self._last_key = None
+            self.solver.add_notes(after)
+            await asyncio.sleep(settings.reading_delay_seconds)
+            await self._advance(await self.controller.extract_interactive_dom())   # else the loop's quiz turn presses it once it shows
 
             return True
 
@@ -641,10 +908,8 @@ class CourseRunner:
                 success = await self.controller.click_at_point(action.coordinates.x, action.coordinates.y)
 
             await asyncio.sleep(0.8)
-            for cont_name in ["Continue", "Next", "Next Question"]:
-                if await self.controller.click_by_text(cont_name, require_enabled=True):
-                    console.print(f"[bold green]✓ Feedback acknowledged: '{cont_name}'[/bold green]")
-                    break
+            if success:     # never press Next after a failed submit: that would skip the question unanswered
+                await self._advance(await self.controller.extract_interactive_dom())
 
             return success
 
@@ -662,7 +927,7 @@ class CourseRunner:
                     return await self.execute_action(analysis)
 
             # HARD GUARDRAIL: Intercept clicks on locked progression banner
-            if action.target_text and "complete the content above" in action.target_text.lower():
+            if action.target_text and re.search(r"complete the (content above|question)", action.target_text.lower()):
                 console.print("[bold red]🔒 CANNOT CLICK LOCKED BANNER: Progression is locked until the exercise above is completed![/bold red]")
                 if hasattr(self, "current_dom_data") and self.current_dom_data.get("matchingExercise"):
                     console.print("[bold yellow]🔒 Intercepting action: Solving matching exercise first to unlock progression![/bold yellow]")
@@ -728,6 +993,10 @@ class CourseRunner:
 
         return True
 
+    @staticmethod
+    def _print_done() -> None:
+        console.print(Panel("[bold green]COURSE COMPLETED! ALL LESSONS PROCESSED SUCCESSFULLY![/bold green]", border_style="green"))
+
     async def run(self, max_steps: Optional[int] = None) -> None:
         """Main execution loop."""
         limit = max_steps or settings.max_steps
@@ -773,6 +1042,29 @@ class CourseRunner:
             dom_data = await self.controller.extract_interactive_dom()
             self.current_dom_data = dom_data
 
+            if not dom_data.get("quizData") and not dom_data.get("matchingExercise"):
+                self.solver.add_notes(dom_data.get("bodyTextPreview", ""))
+
+            # Generic stuck detection: the page (text / question / matching state) has not changed for several steps.
+            sig = (current_url, (dom_data.get("bodyTextPreview") or "")[:600],
+                   (dom_data.get("quizData") or {}).get("indicator"), (dom_data.get("matchingExercise") or {}).get("status"))
+            self.stagnant = self.stagnant + 1 if sig == self.last_sig else 0
+            self.last_sig = sig
+            if self.stagnant and self.stagnant % 5 == 0:
+                if self.stagnant >= 15:
+                    console.print("[bold red]Page unchanged for 15 steps. Stopping to avoid burning API calls.[/bold red]")
+                    break
+                if self.stagnant >= 10:
+                    console.print("[yellow]Stuck for 10 steps: reloading the page...[/yellow]")
+                    await self.controller.page.reload(wait_until="domcontentloaded")
+                    await asyncio.sleep(2)
+                else:
+                    console.print("[yellow]Stuck for 5 steps: scrolling down and forcing progression...[/yellow]")
+                    await self.controller.scroll_to_bottom()
+                    if not self._quiz_open(dom_data):      # never skip past an unanswered question
+                        await self._try_advance()
+                continue
+
             # ↺ RETAKE QUIZ IF FAILED: Detect 'Quiz Results' screen with 'TAKE AGAIN' button
             is_take_again = any("take again" in (b.get("text", "") + " " + b.get("ariaLabel", "")).lower() for b in dom_data.get("buttons", [])) or \
                             "take again" in dom_data.get("bodyTextPreview", "").lower()
@@ -784,8 +1076,18 @@ class CourseRunner:
                     border_style="yellow"
                 ))
                 if await self.controller.click_by_text("TAKE AGAIN"):
+                    self.answered.clear()
+                    self.solver.start_retake()
+                    self._solved.clear()
+                    self._qdone, self._qtries = None, {}
+                    self._done_sigs.clear()
                     await asyncio.sleep(1.5)
                     continue
+
+            # Quiz question on screen: answer it deterministically (no vision-model call, no way to skip it);
+            # then the multi-question assessment logic: next question ... 'Complete the assessment' only when all are answered
+            if await self._quiz_turn(dom_data) or await self._assessment_turn(dom_data):
+                continue
 
             # ⚡ FAST PATH: If the slide already has an enabled progression button with NO lock, NO quiz, and NO matching
             is_locked = dom_data.get("isProgressionLocked", False)
@@ -812,13 +1114,32 @@ class CourseRunner:
             # Capture visual for deep analysis
             screenshot_b64 = await self.controller.get_screenshot_base64(save_path=screenshot_path)
 
+            st = self._assess(dom_data)
+            if st:
+                dom_data["assessmentStatus"] = (f"{len(self.answered)}/{st['total'] or '?'} questions submitted. "
+                                                "Do NOT click 'Complete the assessment'; the runner does it once all are answered.")
+
             # Analyze with OpenAI
-            try:
-                analysis = await self.analyzer.analyze(screenshot_b64, dom_data)
-                self.print_status(self.step_count, analysis)
-            except Exception as e:
-                console.print(f"[bold red]Analysis error: {e}[/bold red]")
+            analysis = None
+            for attempt in range(3):
+                try:
+                    analysis = await self.analyzer.analyze(screenshot_b64, dom_data)
+                    break
+                except Exception as e:
+                    console.print(f"[bold red]Analysis error (attempt {attempt + 1}/3): {e}[/bold red]")
+                    await asyncio.sleep(2 ** attempt)
+            if analysis is None:
                 break
+            self.print_status(self.step_count, analysis)
+
+            # COMPLETED must be seen twice in a row before we stop (one misread screenshot must not end the run)
+            self.done_streak = self.done_streak + 1 if analysis.page_state == "COMPLETED" else 0
+            if self.done_streak >= 2:
+                self._print_done()
+                break
+
+            if await self._block_premature_complete(analysis, dom_data):
+                continue
 
             # If on a quiz question with options present, NEVER idle wait or scroll! Select and submit immediately!
             if analysis.action.action_type in ("WAIT", "SCROLL_DOWN") and (dom_data.get("quizData") or {}).get("options"):
@@ -833,7 +1154,7 @@ class CourseRunner:
                     if self.repeat_action_count >= 3:
                         console.print("[yellow]Same click repeated 3 times. Attempting auto-progression scroll...[/yellow]")
                         await self.controller.scroll_to_bottom()
-                        for btn in ["Continue", "Next", "Next Lesson", "Submit"]:
+                        for btn in ([] if self._quiz_open(dom_data) else ["Continue", "Next", "Next Lesson", "Submit"]):
                             if await self.controller.click_by_text(btn):
                                 break
                         self.repeat_action_count = 0
